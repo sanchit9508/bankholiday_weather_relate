@@ -1,0 +1,16 @@
+{
+  "name": "bank-holiday-planner",
+  "private": true,
+  "type": "module",
+  "workspaces": ["server", "web"],
+  "engines": { "node": ">=22.13" },
+  "scripts": {
+    "dev:api": "npm run dev -w server",
+    "dev:web": "npm run dev -w web",
+    "refresh": "npm run refresh -w server",
+    "build": "npm run build -w web",
+    "start": "npm start -w server",
+    "test": "npm test -w server",
+    "n8n:build": "node n8n/build-workflow.mjs"
+  }
+}

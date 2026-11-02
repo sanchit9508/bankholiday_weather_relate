@@ -1,0 +1,338 @@
+{
+  "id": "bankHolidayPlanner",
+  "name": "Bank holiday planner",
+  "active": false,
+  "nodes": [
+    {
+      "id": "daily-schedule",
+      "name": "Every day at 06:00",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        0
+      ],
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "days",
+              "triggerAtHour": 6
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "manual",
+      "name": "Run manually",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        200
+      ],
+      "parameters": {}
+    },
+    {
+      "id": "get-bank-holidays",
+      "name": "Get bank holidays",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        240,
+        100
+      ],
+      "parameters": {
+        "url": "https://www.gov.uk/bank-holidays.json",
+        "options": {
+          "timeout": 15000
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "onError": "continueErrorOutput"
+    },
+    {
+      "id": "expand-divisions",
+      "name": "Expand divisions",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        480,
+        0
+      ],
+      "parameters": {
+        "jsCode": "// Pure join logic shared by the n8n Code node and server/scripts/refresh.js.\n// Keep this file free of imports: n8n/build-workflow.mjs inlines it into the workflow.\n\nconst DIVISIONS = [\n  { division: 'england-and-wales', label: 'England and Wales', location: { name: 'London', latitude: 51.51, longitude: -0.13 } },\n  { division: 'scotland', label: 'Scotland', location: { name: 'Edinburgh', latitude: 55.95, longitude: -3.19 } },\n  { division: 'northern-ireland', label: 'Northern Ireland', location: { name: 'Belfast', latitude: 54.6, longitude: -5.93 } },\n];\n\nconst HOLIDAYS_URL = 'https://www.gov.uk/bank-holidays.json';\nconst HOLIDAYS_KEPT = 10;\nconst CLIMATE_YEARS = 5;\nconst CLIMATE_WINDOW_DAYS = 3;\nconst WET_DAY_MM = 1;\n\nfunction londonDate(now) {\n  return new Intl.DateTimeFormat('en-CA', { timeZone: 'Europe/London' }).format(now);\n}\n\nfunction dayNumber(isoDate) {\n  return Date.parse(`${isoDate}T00:00:00Z`) / 86_400_000;\n}\n\nfunction round(value) {\n  return Math.round(value * 10) / 10;\n}\n\nfunction mean(values) {\n  return values.reduce((sum, value) => sum + value, 0) / values.length;\n}\n\nfunction numbers(values) {\n  return values.filter((value) => typeof value === 'number');\n}\n\nfunction weatherUrls({ location }, today) {\n  const year = Number(today.slice(0, 4));\n  const position = `latitude=${location.latitude}&longitude=${location.longitude}&timezone=Europe%2FLondon`;\n  const temperature = 'temperature_2m_max,temperature_2m_min,precipitation_sum';\n  return {\n    forecastUrl: `https://api.open-meteo.com/v1/forecast?${position}&forecast_days=16&daily=weather_code,${temperature},precipitation_probability_max`,\n    climateUrl: `https://archive-api.open-meteo.com/v1/archive?${position}&start_date=${year - CLIMATE_YEARS}-01-01&end_date=${year - 1}-12-31&daily=${temperature}`,\n    seasonalUrl: `https://seasonal-api.open-meteo.com/v1/seasonal?${position}&forecast_days=217&daily=${temperature}`,\n  };\n}\n\nfunction hasDaily(response) {\n  return Array.isArray(response?.daily?.time);\n}\n\nfunction fromForecast(forecast, date) {\n  const index = forecast.daily.time.indexOf(date);\n  const daily = forecast.daily;\n  if (index === -1 || typeof daily.temperature_2m_max[index] !== 'number') return null;\n  return {\n    source: 'forecast',\n    tempMaxC: daily.temperature_2m_max[index],\n    tempMinC: daily.temperature_2m_min[index],\n    precipMm: daily.precipitation_sum[index],\n    rainChancePct: daily.precipitation_probability_max[index],\n    weatherCode: daily.weather_code[index],\n  };\n}\n\n// Averages the same calendar window across past years, so a date that moves\n// between years (Easter) or only exists in leap years (29 Feb) still has data.\nfunction fromClimate(climate, date) {\n  const target = date.slice(5);\n  const daily = climate.daily;\n  const indexes = [];\n  daily.time.forEach((day, index) => {\n    const anchor = `${day.slice(0, 4)}-${target === '02-29' ? '02-28' : target}`;\n    if (Math.abs(dayNumber(day) - dayNumber(anchor)) <= CLIMATE_WINDOW_DAYS) indexes.push(index);\n  });\n  const pick = (key) => numbers(indexes.map((index) => daily[key][index]));\n  const highs = pick('temperature_2m_max');\n  const lows = pick('temperature_2m_min');\n  const rain = pick('precipitation_sum');\n  if (!highs.length || !lows.length || !rain.length) return null;\n  return {\n    source: 'climate',\n    tempMaxC: round(mean(highs)),\n    tempMinC: round(mean(lows)),\n    precipMm: round(mean(rain)),\n    rainChancePct: Math.round((rain.filter((mm) => mm >= WET_DAY_MM).length / rain.length) * 100),\n    weatherCode: null,\n  };\n}\n\n// The seasonal API returns one control run plus 50 `_memberNN` columns per variable.\nfunction fromSeasonal(seasonal, date) {\n  const index = seasonal.daily.time.indexOf(date);\n  if (index === -1) return null;\n  const members = (variable) =>\n    numbers(\n      Object.keys(seasonal.daily)\n        .filter((key) => key === variable || key.startsWith(`${variable}_member`))\n        .map((key) => seasonal.daily[key][index]),\n    );\n  const highs = members('temperature_2m_max');\n  const lows = members('temperature_2m_min');\n  const rain = members('precipitation_sum');\n  if (!highs.length || !lows.length || !rain.length) return null;\n  return {\n    source: 'seasonal',\n    tempMaxC: round(mean(highs)),\n    tempMinC: round(mean(lows)),\n    precipMm: round(mean(rain)),\n    rainChancePct: Math.round((rain.filter((mm) => mm >= WET_DAY_MM).length / rain.length) * 100),\n    weatherCode: null,\n  };\n}\n\nconst UNAVAILABLE = { source: 'unavailable', tempMaxC: null, tempMinC: null, precipMm: null, rainChancePct: null, weatherCode: null };\n\nfunction chooseWeather(sources, date) {\n  return (\n    (hasDaily(sources.forecast) && fromForecast(sources.forecast, date)) ||\n    (hasDaily(sources.climate) && fromClimate(sources.climate, date)) ||\n    (hasDaily(sources.seasonal) && fromSeasonal(sources.seasonal, date)) ||\n    UNAVAILABLE\n  );\n}\n\n// weather: { [division]: { forecast, climate, seasonal } }. A failed source can be\n// anything without `daily`; the holiday then falls through to the next source.\nfunction buildSnapshot({ bankHolidays, weather, now }) {\n  const today = londonDate(now);\n  const failedSources = [];\n  const divisions = DIVISIONS.map(({ division, label, location }) => {\n    const events = bankHolidays?.[division]?.events;\n    if (!Array.isArray(events)) throw new Error(`gov.uk response has no events for ${division}`);\n    const sources = weather[division] ?? {};\n    for (const name of ['forecast', 'climate', 'seasonal']) {\n      if (!hasDaily(sources[name])) failedSources.push(`${division}:${name}`);\n    }\n    const holidays = events\n      .filter((event) => event.date >= today)\n      .sort((a, b) => a.date.localeCompare(b.date))\n      .slice(0, HOLIDAYS_KEPT)\n      .map((event) => ({\n        date: event.date,\n        title: event.title,\n        notes: event.notes ?? '',\n        bunting: Boolean(event.bunting),\n        weather: chooseWeather(sources, event.date),\n      }));\n    return { division, label, location, holidays };\n  });\n  return { generatedAt: now.toISOString(), failedSources, divisions };\n}\n\nconst today = londonDate(new Date());\nreturn DIVISIONS.map((entry) => ({ json: { division: entry.division, ...weatherUrls(entry, today) } }));"
+      }
+    },
+    {
+      "id": "forecast-16-days-",
+      "name": "Forecast (16 days)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        720,
+        0
+      ],
+      "parameters": {
+        "url": "={{ $json.forecastUrl }}",
+        "options": {
+          "timeout": 15000
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "id": "archive-5-years-",
+      "name": "Archive (5 years)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        960,
+        0
+      ],
+      "parameters": {
+        "url": "={{ $('Expand divisions').item.json.climateUrl }}",
+        "options": {
+          "timeout": 15000
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "id": "seasonal-ensemble",
+      "name": "Seasonal ensemble",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1200,
+        0
+      ],
+      "parameters": {
+        "url": "={{ $('Expand divisions').item.json.seasonalUrl }}",
+        "options": {
+          "timeout": 15000
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "id": "combine",
+      "name": "Combine sources",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1440,
+        0
+      ],
+      "parameters": {
+        "jsCode": "// Pure join logic shared by the n8n Code node and server/scripts/refresh.js.\n// Keep this file free of imports: n8n/build-workflow.mjs inlines it into the workflow.\n\nconst DIVISIONS = [\n  { division: 'england-and-wales', label: 'England and Wales', location: { name: 'London', latitude: 51.51, longitude: -0.13 } },\n  { division: 'scotland', label: 'Scotland', location: { name: 'Edinburgh', latitude: 55.95, longitude: -3.19 } },\n  { division: 'northern-ireland', label: 'Northern Ireland', location: { name: 'Belfast', latitude: 54.6, longitude: -5.93 } },\n];\n\nconst HOLIDAYS_URL = 'https://www.gov.uk/bank-holidays.json';\nconst HOLIDAYS_KEPT = 10;\nconst CLIMATE_YEARS = 5;\nconst CLIMATE_WINDOW_DAYS = 3;\nconst WET_DAY_MM = 1;\n\nfunction londonDate(now) {\n  return new Intl.DateTimeFormat('en-CA', { timeZone: 'Europe/London' }).format(now);\n}\n\nfunction dayNumber(isoDate) {\n  return Date.parse(`${isoDate}T00:00:00Z`) / 86_400_000;\n}\n\nfunction round(value) {\n  return Math.round(value * 10) / 10;\n}\n\nfunction mean(values) {\n  return values.reduce((sum, value) => sum + value, 0) / values.length;\n}\n\nfunction numbers(values) {\n  return values.filter((value) => typeof value === 'number');\n}\n\nfunction weatherUrls({ location }, today) {\n  const year = Number(today.slice(0, 4));\n  const position = `latitude=${location.latitude}&longitude=${location.longitude}&timezone=Europe%2FLondon`;\n  const temperature = 'temperature_2m_max,temperature_2m_min,precipitation_sum';\n  return {\n    forecastUrl: `https://api.open-meteo.com/v1/forecast?${position}&forecast_days=16&daily=weather_code,${temperature},precipitation_probability_max`,\n    climateUrl: `https://archive-api.open-meteo.com/v1/archive?${position}&start_date=${year - CLIMATE_YEARS}-01-01&end_date=${year - 1}-12-31&daily=${temperature}`,\n    seasonalUrl: `https://seasonal-api.open-meteo.com/v1/seasonal?${position}&forecast_days=217&daily=${temperature}`,\n  };\n}\n\nfunction hasDaily(response) {\n  return Array.isArray(response?.daily?.time);\n}\n\nfunction fromForecast(forecast, date) {\n  const index = forecast.daily.time.indexOf(date);\n  const daily = forecast.daily;\n  if (index === -1 || typeof daily.temperature_2m_max[index] !== 'number') return null;\n  return {\n    source: 'forecast',\n    tempMaxC: daily.temperature_2m_max[index],\n    tempMinC: daily.temperature_2m_min[index],\n    precipMm: daily.precipitation_sum[index],\n    rainChancePct: daily.precipitation_probability_max[index],\n    weatherCode: daily.weather_code[index],\n  };\n}\n\n// Averages the same calendar window across past years, so a date that moves\n// between years (Easter) or only exists in leap years (29 Feb) still has data.\nfunction fromClimate(climate, date) {\n  const target = date.slice(5);\n  const daily = climate.daily;\n  const indexes = [];\n  daily.time.forEach((day, index) => {\n    const anchor = `${day.slice(0, 4)}-${target === '02-29' ? '02-28' : target}`;\n    if (Math.abs(dayNumber(day) - dayNumber(anchor)) <= CLIMATE_WINDOW_DAYS) indexes.push(index);\n  });\n  const pick = (key) => numbers(indexes.map((index) => daily[key][index]));\n  const highs = pick('temperature_2m_max');\n  const lows = pick('temperature_2m_min');\n  const rain = pick('precipitation_sum');\n  if (!highs.length || !lows.length || !rain.length) return null;\n  return {\n    source: 'climate',\n    tempMaxC: round(mean(highs)),\n    tempMinC: round(mean(lows)),\n    precipMm: round(mean(rain)),\n    rainChancePct: Math.round((rain.filter((mm) => mm >= WET_DAY_MM).length / rain.length) * 100),\n    weatherCode: null,\n  };\n}\n\n// The seasonal API returns one control run plus 50 `_memberNN` columns per variable.\nfunction fromSeasonal(seasonal, date) {\n  const index = seasonal.daily.time.indexOf(date);\n  if (index === -1) return null;\n  const members = (variable) =>\n    numbers(\n      Object.keys(seasonal.daily)\n        .filter((key) => key === variable || key.startsWith(`${variable}_member`))\n        .map((key) => seasonal.daily[key][index]),\n    );\n  const highs = members('temperature_2m_max');\n  const lows = members('temperature_2m_min');\n  const rain = members('precipitation_sum');\n  if (!highs.length || !lows.length || !rain.length) return null;\n  return {\n    source: 'seasonal',\n    tempMaxC: round(mean(highs)),\n    tempMinC: round(mean(lows)),\n    precipMm: round(mean(rain)),\n    rainChancePct: Math.round((rain.filter((mm) => mm >= WET_DAY_MM).length / rain.length) * 100),\n    weatherCode: null,\n  };\n}\n\nconst UNAVAILABLE = { source: 'unavailable', tempMaxC: null, tempMinC: null, precipMm: null, rainChancePct: null, weatherCode: null };\n\nfunction chooseWeather(sources, date) {\n  return (\n    (hasDaily(sources.forecast) && fromForecast(sources.forecast, date)) ||\n    (hasDaily(sources.climate) && fromClimate(sources.climate, date)) ||\n    (hasDaily(sources.seasonal) && fromSeasonal(sources.seasonal, date)) ||\n    UNAVAILABLE\n  );\n}\n\n// weather: { [division]: { forecast, climate, seasonal } }. A failed source can be\n// anything without `daily`; the holiday then falls through to the next source.\nfunction buildSnapshot({ bankHolidays, weather, now }) {\n  const today = londonDate(now);\n  const failedSources = [];\n  const divisions = DIVISIONS.map(({ division, label, location }) => {\n    const events = bankHolidays?.[division]?.events;\n    if (!Array.isArray(events)) throw new Error(`gov.uk response has no events for ${division}`);\n    const sources = weather[division] ?? {};\n    for (const name of ['forecast', 'climate', 'seasonal']) {\n      if (!hasDaily(sources[name])) failedSources.push(`${division}:${name}`);\n    }\n    const holidays = events\n      .filter((event) => event.date >= today)\n      .sort((a, b) => a.date.localeCompare(b.date))\n      .slice(0, HOLIDAYS_KEPT)\n      .map((event) => ({\n        date: event.date,\n        title: event.title,\n        notes: event.notes ?? '',\n        bunting: Boolean(event.bunting),\n        weather: chooseWeather(sources, event.date),\n      }));\n    return { division, label, location, holidays };\n  });\n  return { generatedAt: now.toISOString(), failedSources, divisions };\n}\n\nconst responses = (name) => $(name).all().map((item) => item.json);\nconst expanded = responses('Expand divisions');\nconst forecast = responses('Forecast (16 days)');\nconst climate = responses('Archive (5 years)');\nconst seasonal = responses('Seasonal ensemble');\nconst weather = Object.fromEntries(\n  expanded.map(({ division }, index) => [\n    division,\n    { forecast: forecast[index], climate: climate[index], seasonal: seasonal[index] },\n  ]),\n);\nconst bankHolidays = $('Get bank holidays').first().json;\nreturn [{ json: buildSnapshot({ bankHolidays, weather, now: new Date() }) }];"
+      },
+      "onError": "continueErrorOutput"
+    },
+    {
+      "id": "post-ingest",
+      "name": "Send to planner API",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1680,
+        -100
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "={{ ($env.PLANNER_API_URL || 'http://localhost:3001') + '/api/v1/ingest' }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "X-API-Key",
+              "value": "={{ $env.PLANNER_INGEST_KEY }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json) }}",
+        "options": {
+          "timeout": 15000
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "onError": "continueErrorOutput"
+    },
+    {
+      "id": "holidays-failed",
+      "name": "Holidays failed",
+      "type": "n8n-nodes-base.stopAndError",
+      "typeVersion": 1,
+      "position": [
+        480,
+        240
+      ],
+      "parameters": {
+        "errorMessage": "={{ \"gov.uk fetch failed: \" + ($json.error?.message ?? \"unknown error\") }}"
+      }
+    },
+    {
+      "id": "combine-failed",
+      "name": "Combine failed",
+      "type": "n8n-nodes-base.stopAndError",
+      "typeVersion": 1,
+      "position": [
+        1680,
+        100
+      ],
+      "parameters": {
+        "errorMessage": "={{ \"Join failed: \" + ($json.error?.message ?? \"unknown error\") }}"
+      }
+    },
+    {
+      "id": "ingest-failed",
+      "name": "Ingest failed",
+      "type": "n8n-nodes-base.stopAndError",
+      "typeVersion": 1,
+      "position": [
+        1920,
+        0
+      ],
+      "parameters": {
+        "errorMessage": "={{ \"Planner API rejected the data: \" + ($json.error?.message ?? \"unknown error\") }}"
+      }
+    }
+  ],
+  "connections": {
+    "Every day at 06:00": {
+      "main": [
+        [
+          {
+            "node": "Get bank holidays",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Run manually": {
+      "main": [
+        [
+          {
+            "node": "Get bank holidays",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get bank holidays": {
+      "main": [
+        [
+          {
+            "node": "Expand divisions",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Holidays failed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Expand divisions": {
+      "main": [
+        [
+          {
+            "node": "Forecast (16 days)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Forecast (16 days)": {
+      "main": [
+        [
+          {
+            "node": "Archive (5 years)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Archive (5 years)": {
+      "main": [
+        [
+          {
+            "node": "Seasonal ensemble",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Seasonal ensemble": {
+      "main": [
+        [
+          {
+            "node": "Combine sources",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Combine sources": {
+      "main": [
+        [
+          {
+            "node": "Send to planner API",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Combine failed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send to planner API": {
+      "main": [
+        [],
+        [
+          {
+            "node": "Ingest failed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "Europe/London"
+  },
+  "pinData": {}
+}
